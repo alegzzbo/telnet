@@ -1323,7 +1323,7 @@ func escapeMode(stdinChan <-chan []byte) bool {
 					if ok {
 						initial = expandForEdit(cfg.OnConnect)
 					} else {
-						cfg := HostConfig{
+						cfg = HostConfig{
 							Host:          host,
 							Port:          port,
 							KeepAlive:     int(keepaliveDuration.Seconds()),
