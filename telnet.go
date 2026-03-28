@@ -120,6 +120,7 @@ var (
 	lastOutput string
 	lastOutputMutex sync.Mutex
 	globalWaitTimeout int
+	currentWaitTimeout int
 )
 
 // Keyring funcs
@@ -316,12 +317,12 @@ func parseWaitCommand(cmd string, prefix string) (string, int) {
 	last := strings.LastIndex(s, ":")
 
 	if last == -1 {
-		return s, globalWaitTimeout
+		return s, currentWaitTimeout
 	}
 
 	timeout, err := strconv.Atoi(s[last+1:])
 	if err != nil {
-		return s, globalWaitTimeout
+		return s, currentWaitTimeout
 	}
     if timeout == 0 {
         return s, 0 // бесконечное ожидание
@@ -485,7 +486,7 @@ func loadConfig() (map[string]HostConfig, map[string]HostConfig) {
 	return aliases, byHost
 }
 
-func addHostToConfig(alias, host, port string) error {
+func saveHostToConfig(hostcfg HostConfig) error {
 	exePath, err := os.Executable()
 	if err != nil {
 		return err
@@ -500,61 +501,32 @@ func addHostToConfig(alias, host, port string) error {
 		json.Unmarshal(data, &cfg)
 	}
 
-	newHost := HostConfig{
-		Alias: alias,
-		Host:  host,
-		Port:  port,
-	}
+    found := false
 
-	cfg.Hosts = append(cfg.Hosts, newHost)
+    for i := range cfg.Hosts {
+        h := &cfg.Hosts[i]
 
-	out, err := json.MarshalIndent(cfg, "", "  ")
-	if err != nil {
-		return err
-	}
+        p := h.Port
+        if p == "" {
+            p = "23"
+        }
 
-	return os.WriteFile(configPath, out, 0644)
-}
-
-func updateHostOnConnect(host, port string, cmds []string) error {
-	exePath, err := os.Executable()
-	if err != nil {
-		return err
-	}
-
-	configPath := filepath.Join(filepath.Dir(exePath), "telnet.json")
-
-	var cfg ConfigFile
-
-	data, err := os.ReadFile(configPath)
-	if err == nil {
-		json.Unmarshal(data, &cfg)
-	}
-
-	found := false
-
-	for i := range cfg.Hosts {
-		h := &cfg.Hosts[i]
-
-		p := h.Port
-		if p == "" {
-			p = "23"
+		port := hostcfg.Port
+		if port == "" {
+			port = "23"
 		}
 
-		if h.Host == host && p == port {
-			h.OnConnect = cmds
-			found = true
-			break
-		}
-	}
+        if h.Host == hostcfg.Host && p == port {
+            *h = hostcfg
+            found = true
+            break
+        }
+    }
 
-	if !found {
-		cfg.Hosts = append(cfg.Hosts, HostConfig{
-			Host:      host,
-			Port:      port,
-			OnConnect: cmds,
-		})
-	}
+    if !found {
+        cfg.Hosts = append(cfg.Hosts, hostcfg)
+    }
+
 
 	out, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
@@ -838,12 +810,18 @@ func connect() error {
 	return nil
 }
 
-func applyHostKeepaliveConfig(cfg *HostConfig) {
+func applyHostConfig(cfg *HostConfig) {
 	if cfg != nil && cfg.KeepAlive > 0 {
 		keepaliveDuration = time.Duration(cfg.KeepAlive) * time.Second
 	} else {
 		keepaliveDuration = time.Duration(globalKeepalive) * time.Second
 	}
+	
+	if cfg != nil && cfg.WaitTimeout > 0 {
+        currentWaitTimeout = cfg.WaitTimeout
+    } else {
+        currentWaitTimeout = globalWaitTimeout
+    }
 
 	if cfg != nil && cfg.KeepAliveType != "" {
 		keepaliveType = cfg.KeepAliveType
@@ -1105,7 +1083,7 @@ func escapeMode(stdinChan <-chan []byte) bool {
 		baseCmd := strings.ToLower(parts[0])
 
 		switch baseCmd {
-		case "addhost":
+		case "savehost":
 			var alias string
 
 			if len(parts) >= 2 {
@@ -1122,8 +1100,22 @@ func escapeMode(stdinChan <-chan []byte) bool {
 				fmt.Printf("%sInvalid address%s\r\n", ColorRed, ColorReset)
 				break
 			}
+			
+			cfg := HostConfig{
+				Alias:         alias,
+				Host:          host,
+				Port:          port,
+				KeepAlive:     int(keepaliveDuration.Seconds()),
+				KeepAliveType: keepaliveType,
+				WaitTimeout:   currentWaitTimeout,
+			}
+			
+			existing, ok := findHostConfig(addr)
+			if ok {
+				cfg.OnConnect = existing.OnConnect
+			}
 
-			err = addHostToConfig(alias, host, port)
+			err = saveHostToConfig(cfg)
 			if err != nil {
 				fmt.Printf("%sFailed to save host: %v%s\r\n", ColorRed, err, ColorReset)
 				break
@@ -1224,7 +1216,7 @@ func escapeMode(stdinChan <-chan []byte) bool {
 				addr = newTarget
 			}
 
-			applyHostKeepaliveConfig(matchedConfig)
+			applyHostConfig(matchedConfig)
 
 			fmt.Printf("%sConnecting to %s...%s\r\n", ColorCyan, addr, ColorReset)
 			if err := connect(); err != nil {
@@ -1299,7 +1291,12 @@ func escapeMode(stdinChan <-chan []byte) bool {
 
 			switch sub {
 				case "clear":
-					err := updateHostOnConnect(host, port, nil)
+					cfg, ok := findHostConfig(addr)
+					if ok {
+						cfg.OnConnect = nil
+					}
+
+					err := saveHostToConfig(cfg)
 					if err != nil {
 						fmt.Printf("%sFailed to update config: %v%s\r\n", ColorRed, err, ColorReset)
 						break
@@ -1326,6 +1323,13 @@ func escapeMode(stdinChan <-chan []byte) bool {
 					if ok {
 						initial = expandForEdit(cfg.OnConnect)
 					} else {
+						cfg := HostConfig{
+							Host:          host,
+							Port:          port,
+							KeepAlive:     int(keepaliveDuration.Seconds()),
+							KeepAliveType: keepaliveType,
+							WaitTimeout:   currentWaitTimeout,
+						}
 						initial = []string{""}
 					}
 
@@ -1334,9 +1338,9 @@ func escapeMode(stdinChan <-chan []byte) bool {
 						break
 					}
 					
-					processed := processEditorLines(cmds)
+					cfg.OnConnect = processEditorLines(cmds)
 
-					updateHostOnConnect(host, port, processed)
+					saveHostToConfig(cfg)
 					fmt.Printf("%sOn-connect updated%s\r\n", ColorGreen, ColorReset)
 
 				default:
@@ -1348,7 +1352,7 @@ func escapeMode(stdinChan <-chan []byte) bool {
 
 		case "help", "?":
 			fmt.Printf("%sAvailable commands:%s\r\n", ColorYellow, ColorReset)
-			fmt.Printf("  %saddhost [alias]%s             - Save current host to config\r\n", ColorGreen, ColorReset)
+			fmt.Printf("  %ssavehost [alias]%s             - Save current host to config\r\n", ColorGreen, ColorReset)
 			fmt.Printf("  %sresume, c%s                    - Resume session\r\n", ColorGreen, ColorReset)
 			fmt.Printf("  %sstatus%s                       - Show connection status\r\n", ColorGreen, ColorReset)
 			fmt.Printf("  %sconnect <host_or_alias>[:port]%s - Connect to a new host\r\n", ColorGreen, ColorReset)
@@ -1583,7 +1587,7 @@ func main() {
 		}
 	}
 
-	applyHostKeepaliveConfig(matchedConfig)
+	applyHostConfig(matchedConfig)
 
 	if err := connect(); err != nil {
 		fmt.Printf("%sConnection error: %v%s\n", ColorRed, err, ColorReset)
