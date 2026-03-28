@@ -1,53 +1,70 @@
 # 📡 Telnet Client (Advanced)
 
-> 🇬🇧 Advanced Telnet client with automation, encryption and escape mode  
-> 🇷🇺 Продвинутый telnet-клиент с автоматизацией, шифрованием и escape-режимом  
+<p align="center">
+  <b>Powerful telnet client with automation, encryption and escape mode</b><br>
+  <b>Мощный telnet-клиент с автоматизацией, шифрованием и escape-режимом</b>
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/Go-1.20+-00ADD8?logo=go">
+  <img src="https://img.shields.io/badge/platform-linux%20%7C%20macos-blue">
+  <img src="https://img.shields.io/badge/license-MIT-green">
+</p>
 
 ---
 
 ## 🧾 Table of Contents
 
-- [English](#-english)
-- [Русский](#-русский)
+- [⚡ Quick Start](#-quick-start)
+- [🎬 Demo](#-demo)
+- [🚀 Features](#-features)
+- [⚙️ Configuration](#️-configuration-telnetjson)
+- [🤖 Automation (on_connect)](#-automation-on_connect)
+- [🎨 Colors](#-colors)
+- [🔐 Secrets](#-secrets)
+- [⚡ Keepalive](#-keepalive)
+- [⎋ Escape Mode](#-escape-mode)
+- [🌍 Examples](#-examples-real-world)
+- [🇷🇺 Русский](#-русский)
 
 ---
 
-# 🇬🇧 English
+# ⚡ Quick Start
 
-## 🚀 Features
+```bash
+go build -o telnet
+./telnet example.com
+```
+
+---
+
+# 🎬 Demo
+
+> 👉 Replace with your gif (asciinema recommended)
+
+```
+telnet> status
+Connected to 10.0.0.1:23
+```
+
+---
+
+# 🚀 Features
 
 - 🔐 AES encryption + OS keyring
 - 🎨 Regex-based colored output
 - ⚡ Keepalive (anti-idle)
-- 🤖 Expect-like automation (`on_connect`)
+- 🤖 Expect-like automation
 - ✍️ Built-in editor
 - ⎋ Escape mode (Ctrl+])
 
 ---
 
-## ⚡ Installation
+# ⚙️ Configuration (`telnet.json`)
 
-```bash
-go build -o telnet
-```
+Located near binary.
 
----
-
-## ▶️ Usage
-
-```bash
-./telnet example.com
-./telnet example.com 2323
-./telnet myalias
-```
-
----
-
-## ⚙️ Configuration (`telnet.json`)
-
-Located near the binary.
-
-### Full example
+## Example
 
 ```json
 {
@@ -59,30 +76,13 @@ Located near the binary.
     {
       "pattern": "ERROR",
       "color": "red"
-    },
-    {
-      "pattern": "(user: )(\\w+)",
-      "groups": {
-        "1": "cyan",
-        "2": "green"
-      }
     }
   ],
   "hosts": [
     {
-      "alias": "prod",
-      "host": "10.0.0.1",
-      "port": "23",
-      "keepalive": 30,
-      "keepalive_type": "0x13",
-      "on_connect": [
-        "wait:login:",
-        "admin",
-        "wait:Password:",
-        "enc:BASE64_ENCRYPTED",
-        "wait:#",
-        "terminal length 0"
-      ]
+      "alias": "router",
+      "host": "192.168.1.1",
+      "on_connect": []
     }
   ]
 }
@@ -90,104 +90,37 @@ Located near the binary.
 
 ---
 
-## 🔐 Secrets
+# 🤖 Automation (`on_connect`)
 
-Use:
-
-```
-!secret mypassword
-```
-
-It will be stored as:
-
-```
-enc:BASE64
-```
-
-### Key management
-
-```bash
-telnet keys export
-telnet keys import
-```
-
----
-
-## 🤖 on_connect automation
-
-Supported commands:
+## Commands
 
 | Command | Description |
 |--------|------------|
-| `wait:text` | wait for string |
-| `wait:text:5` | wait with timeout |
-| `waitre:regex` | wait regex |
-| `command` | send command |
+| wait:text | wait for string |
+| wait:text:5 | wait with timeout |
+| waitre:regex | wait regex |
+| command | send command |
 
 ---
 
-## ⚡ Keepalive
+## Example
 
-| Type | Behavior |
-|------|--------|
-| space_bs | space + backspace |
-| 0x13 | CRLF |
-| 0x00 | NULL |
-
-CLI example:
-
-```bash
-./telnet -keepalive 30 -keepalive_type 0x13 host
+```json
+"on_connect": [
+  "wait:login:",
+  "admin",
+  "wait:Password:",
+  "enc:xxxx",
+  "wait:#",
+  "terminal length 0"
+]
 ```
 
 ---
 
-## ⎋ Escape Mode
+# 🎨 Colors
 
-Trigger:
-
-```
-CTRL + ]
-```
-
-Prompt:
-
-```
-telnet>
-```
-
----
-
-### Commands
-
-| Command | Description |
-|--------|------------|
-| help | show commands |
-| status | connection status |
-| connect | connect to host |
-| close | close connection |
-| reconnect | reconnect |
-| keepalive | set interval |
-| addhost | save host |
-| onconnect | manage automation |
-| keys | key management |
-| resume / c | return to session |
-| quit | exit |
-
----
-
-## ✍️ Built-in Editor
-
-- Ctrl+D → save  
-- Ctrl+C → cancel  
-
-Supports arrows, delete, navigation.
-
----
-
-## 🎨 Colors
-
-Simple:
+## Simple
 
 ```json
 {
@@ -196,7 +129,7 @@ Simple:
 }
 ```
 
-Advanced (groups):
+## Groups (advanced)
 
 ```json
 {
@@ -210,90 +143,13 @@ Advanced (groups):
 
 ---
 
-## 📌 Tips
-
-- Use aliases instead of IP
-- Store passwords only via `!secret`
-- Combine `wait` + commands
-- Use color rules for logs
-
----
-
-# 🇷🇺 Русский
-
-## 🚀 Возможности
-
-- 🔐 AES-шифрование + keyring
-- 🎨 Цветной вывод через regex
-- ⚡ Keepalive (anti-idle)
-- 🤖 Автоматизация (`on_connect`)
-- ✍️ Встроенный редактор
-- ⎋ Escape mode (Ctrl+])
-
----
-
-## ⚡ Установка
-
-```bash
-go build -o telnet
-```
-
----
-
-## ▶️ Запуск
-
-```bash
-./telnet example.com
-./telnet example.com 2323
-./telnet myalias
-```
-
----
-
-## ⚙️ Конфиг (`telnet.json`)
-
-Файл рядом с бинарником.
-
-### Пример
-
-```json
-{
-  "defaults": {
-    "keepalive": 60,
-    "keepalive_type": "space_bs"
-  },
-  "colors": [
-    {
-      "pattern": "ERROR",
-      "color": "red"
-    }
-  ],
-  "hosts": [
-    {
-      "alias": "prod",
-      "host": "10.0.0.1",
-      "on_connect": [
-        "wait:login:",
-        "admin",
-        "wait:Password:",
-        "enc:BASE64"
-      ]
-    }
-  ]
-}
-```
-
----
-
-## 🔐 Секреты
-
-В редакторе:
+# 🔐 Secrets
 
 ```
-!secret password
+!secret mypassword
 ```
 
-→ сохраняется как:
+→ stored as:
 
 ```
 enc:BASE64
@@ -301,34 +157,162 @@ enc:BASE64
 
 ---
 
-## 🤖 on_connect
+# ⚡ Keepalive
 
-Команды:
-
-| Команда | Описание |
-|--------|--------|
-| wait: | ожидание строки |
-| wait:text:<timeout> | ожидание строки с таймаутом |
-| waitre: | regex |
-| команда | отправка |
-
----
-
-## ⚡ Keepalive
-
-Типы:
-
-| Тип | Поведение |
-|-----|--------|
-| space_bs | пробел + backspace |
+| Type | Behavior |
+|------|--------|
+| space_bs | space + backspace |
 | 0x13 | CRLF |
 | 0x00 | NULL |
 
 ---
 
-## ⎋ Escape Mode
+# ⎋ Escape Mode
 
-Активация:
+Trigger:
+
+```
+CTRL + ]
+```
+
+Prompt:
+
+```
+telnet>
+```
+
+## Commands
+
+- help
+- status
+- connect
+- reconnect
+- keepalive
+- onconnect
+- addhost
+- quit
+
+---
+
+# 🌍 Examples (Real-world)
+
+## 🔧 Cisco
+
+```json
+{
+  "alias": "cisco",
+  "host": "10.0.0.1",
+  "on_connect": [
+    "wait:Username:",
+    "admin",
+    "wait:Password:",
+    "enc:xxxx",
+    "wait:#",
+    "terminal length 0"
+  ]
+}
+```
+
+---
+
+## 🌐 MikroTik
+
+```json
+{
+  "alias": "mikrotik",
+  "host": "192.168.88.1",
+  "on_connect": [
+    "wait:Login:",
+    "admin",
+    "wait:Password:",
+    "enc:xxxx",
+    "wait:>",
+    "/terminal length 0"
+  ]
+}
+```
+
+---
+
+## 🐧 Linux (telnet login)
+
+```json
+{
+  "alias": "linux",
+  "host": "192.168.1.10",
+  "on_connect": [
+    "wait:login:",
+    "root",
+    "wait:Password:",
+    "enc:xxxx",
+    "wait:#"
+  ]
+}
+```
+
+---
+
+# 🇷🇺 Русский
+
+## 🚀 Возможности
+
+- 🔐 AES + keyring
+- 🎨 Раскраска regex
+- ⚡ Anti-idle
+- 🤖 Автоматизация
+- ✍️ Редактор
+- ⎋ Escape mode
+
+---
+
+## ⚡ Быстрый старт
+
+```bash
+go build -o telnet
+./telnet example.com
+```
+
+---
+
+## 🤖 on_connect
+
+```
+wait:login:
+admin
+wait:Password:5
+enc:xxxx
+```
+
+---
+
+## 🎨 Раскраска
+
+```json
+{
+  "pattern": "(user: )(\\w+)",
+  "groups": {
+    "1": "yellow",
+    "2": "green"
+  }
+}
+```
+
+---
+
+## 🌍 Примеры
+
+### Cisco
+
+```
+wait:Username:
+admin
+wait:Password:
+enc:xxxx
+```
+
+---
+
+## ⎋ Escape mode
 
 ```
 CTRL + ]
@@ -336,34 +320,12 @@ CTRL + ]
 
 ---
 
-### Команды
+# ⭐ Contributing
 
-| Команда | Описание |
-|--------|--------|
-| help | помощь |
-| status | статус |
-| connect | подключение |
-| close | закрыть |
-| reconnect | переподключить |
-| keepalive | интервал |
-| addhost | сохранить |
-| onconnect | команды |
-| keys | ключи |
-| resume | назад |
-| quit | выход |
+PRs welcome!
 
 ---
 
-## ✍️ Редактор
+# 📄 License
 
-- Ctrl+D → сохранить  
-- Ctrl+C → отменить  
-
----
-
-## 📌 Советы
-
-- используй alias
-- пароли только через `!secret`
-- комбинируй wait + команды
-- раскрашивай логи
+MIT
