@@ -30,6 +30,7 @@
 # ⚡ Quick Start
 
 ```bash
+go mod tidy
 go build -o telnet
 ./telnet example.com
 ```
