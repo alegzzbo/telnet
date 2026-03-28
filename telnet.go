@@ -124,9 +124,77 @@ var (
 )
 
 // Keyring funcs
+func keyStatus() {
+	_, err := keyring.Get("telnet-client", "master_key")
+
+	if err == keyring.ErrNotFound {
+		fmt.Println("No master key")
+		return
+	}
+
+	if err != nil {
+		fmt.Println("Keyring error:", err)
+		return
+	}
+
+	fmt.Println("Master key present")
+}
+
+func deleteMasterKey() {
+	fmt.Print("Delete master key? (yes/no): ")
+	var input string
+	fmt.Scanln(&input)
+
+	if input != "yes" {
+		fmt.Println("Cancelled")
+		return
+	}
+	
+	err := keyring.Delete("telnet-client", "master_key")
+	if err != nil {
+		fmt.Println("Failed to delete key:", err)
+		return
+	}
+
+	fmt.Println("Master key deleted")
+}
+
+func validateMasterKeyFromConfig() {
+	exePath, err := os.Executable()
+	if err != nil {
+		return
+	}
+
+	configPath := filepath.Join(filepath.Dir(exePath), "telnet.json")
+
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		return
+	}
+
+	var cfg ConfigFile
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return
+	}
+
+	for _, h := range cfg.Hosts {
+		for _, cmd := range h.OnConnect {
+			if strings.HasPrefix(cmd, "enc:") {
+				_, err := decryptString(strings.TrimPrefix(cmd, "enc:"))
+				if err != nil {
+					fmt.Printf("%s[warn] master key invalid (cannot decrypt secrets)%s\r\n", ColorYellow, ColorReset)
+					return
+				}
+				// если хоть один расшифровался — ок
+				return
+			}
+		}
+	}
+}
+
 func handleKeysCommand(parts []string, stdinChan <-chan []byte) {
 	if len(parts) < 2 {
-		fmt.Println("Usage: keys export | import")
+		fmt.Println("Usage: keys export | import | delete | status")
 		return
 	}
 
@@ -137,6 +205,12 @@ func handleKeysCommand(parts []string, stdinChan <-chan []byte) {
 
 	case "import":
 		importMasterKey(stdinChan)
+		
+	case "delete":
+		deleteMasterKey()
+		
+	case "status":
+		keyStatus()
 
 	default:
 		fmt.Println("Unknown keys command")
@@ -199,15 +273,15 @@ func encryptString(s string) string {
 	return base64.StdEncoding.EncodeToString(data)
 }
 
-func decryptString(enc string) string {
+func decryptString(enc string) (string, error) {
 	key := getMasterKey()
 	if key == nil {
-		return ""
+		return "", fmt.Errorf("no master key")
 	}
 
 	data, err := base64.StdEncoding.DecodeString(enc)
 	if err != nil {
-		return ""
+		return "", fmt.Errorf("invalid base64")
 	}
 
 	block, _ := aes.NewCipher(key)
@@ -216,15 +290,15 @@ func decryptString(enc string) string {
 	n := gcm.NonceSize()
 
 	if len(data) < n {
-		return ""
+		return "", fmt.Errorf("data too short")
 	}
 
 	out, err := gcm.Open(nil, data[:n], data[n:], nil)
 	if err != nil {
-		return ""
+		return "", fmt.Errorf("decrypt failed (wrong key?)")
 	}
 
-	return string(out)
+	return string(out), nil
 }
 
 func getMasterKey() []byte {
@@ -294,7 +368,10 @@ func expandForEdit(cmds []string) []string {
 				continue
 			}
 
-			plain := decryptString(strings.TrimPrefix(cmd, "enc:"))
+			plain, err := decryptString(strings.TrimPrefix(cmd, "enc:"))
+			if err != nil {
+				continue
+			}
 
 			if plain == "" {
 				continue
@@ -391,9 +468,9 @@ func expandCommands(cmds []string) []string {
 			}
 
 			enc := strings.TrimPrefix(cmd, "enc:")
-			plain := decryptString(enc)
-
-			if plain == "" {
+			plain, err := decryptString(enc)
+			
+			if err != nil || plain == "" {
 				continue
 			}
 
@@ -1555,13 +1632,15 @@ func main() {
 	if flag.NArg() < 1 {
 		fmt.Println("Usage:\n  telnet [cmd|options] <host_or_alias> [port]")
 		fmt.Println("\ncmd:")
-		fmt.Println("\n keys export | import")
+		fmt.Println("\n keys export | import | delete | status")
 		fmt.Println("\nOptions:")
 		flag.PrintDefaults()
 		return
 	}
 
 	configAliases, configByHost = loadConfig()
+	validateMasterKeyFromConfig()
+	
 	inputTarget := flag.Arg(0)
 	port := "23"
 	if flag.NArg() >= 2 {
