@@ -16,7 +16,6 @@
 ## 🧾 Table of Contents
 
 - [⚡ Quick Start](#-quick-start)
-- [🎬 Demo](#-demo)
 - [🚀 Features](#-features)
 - [⚙️ Configuration](#️-configuration-telnetjson)
 - [🤖 Automation (on_connect)](#-automation-on_connect)
@@ -34,17 +33,6 @@
 ```bash
 go build -o telnet
 ./telnet example.com
-```
-
----
-
-# 🎬 Demo
-
-> 👉 Replace with your gif (asciinema recommended)
-
-```
-telnet> status
-Connected to 10.0.0.1:23
 ```
 
 ---
