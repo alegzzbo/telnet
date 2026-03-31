@@ -142,7 +142,8 @@ var (
 	colorRulesMutex sync.RWMutex
 
 	serverDisconnect = make(chan struct{}, 1)
-	inputLocked int32 // atomic: 1 = locked
+	inputLocked  int32 // atomic: 1 = locked
+	inEscapeMode int32 // atomic: 1 = escape mode active, readerLoop не пишет в stdout
 	secretsAvailable = true
 	lastOutput = NewRingBuffer(8192)
 	globalWaitTimeout int
@@ -188,7 +189,33 @@ func (r *RingBuffer) String() string {
 	return string(r.data[r.pos:]) + string(r.data[:r.pos])
 }
 
+// TotalWritten возвращает суммарное число записанных байт (монотонно растёт).
+func (r *RingBuffer) TotalWritten() int64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.totalWritten
+}
 
+// Since возвращает данные записанные после snapshot (значение TotalWritten на момент входа).
+func (r *RingBuffer) Since(snapshot int64) string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	newBytes := r.totalWritten - snapshot
+	if newBytes <= 0 {
+		return ""
+	}
+	if newBytes > int64(r.size) {
+		newBytes = int64(r.size)
+	}
+
+	end := r.pos
+	start := (end - int(newBytes) + r.size) % r.size
+	if start < end {
+		return string(r.data[start:end])
+	}
+	return string(r.data[start:]) + string(r.data[:end])
+}
 
 func autocomplete(input string) (string, []string) {
 	var matches []string
@@ -253,6 +280,8 @@ func readLineInteractive(stdinChan <-chan []byte, history *[]string) string {
 			fmt.Printf("\033[%dD", back)
 		}
 	}
+
+	redraw() // показываем промпт сразу при входе
 
 	for {
 		chunk := <-stdinChan
@@ -1505,17 +1534,16 @@ func runEditor(stdinChan <-chan []byte, initial []string) ([]string, bool) {
 
 func escapeMode(stdinChan <-chan []byte) bool {
 	// Переходим в альтернативный буфер — экран сессии сохраняется терминалом
+	atomic.StoreInt32(&inEscapeMode, 1)
 	fmt.Print("\033[?1049h\033[H\033[2J")
 
-	// restore вызывается при любом выходе кроме quit —
-	// возвращает основной буфер (данные сессии видны как были)
+	// restore: возвращаем основной буфер — терминал сам восстанавливает экран как был
 	restore := func() {
+		atomic.StoreInt32(&inEscapeMode, 0)
 		fmt.Print("\033[?1049l")
 	}
 
 	for {
-		fmt.Printf("%stelnet>%s ", ColorYellow, ColorReset)
-		
 		// Используем уже готовую функцию, которая умеет в стрелочки и редактирование
 		line := readLineInteractive(stdinChan, &escapeHistory)
 		cmd := strings.TrimSpace(line)
@@ -1856,7 +1884,9 @@ func readerLoop(c net.Conn) {
 
 					lastOutput.Write([]byte(out))
 
-					os.Stdout.WriteString(applyColors(out))
+					if atomic.LoadInt32(&inEscapeMode) == 0 {
+						os.Stdout.WriteString(applyColors(out))
+					}
 					textChunk = nil
 				}
 
@@ -1903,7 +1933,9 @@ func readerLoop(c net.Conn) {
 
 			lastOutput.Write([]byte(out))
 
-			os.Stdout.WriteString(applyColors(out))
+			if atomic.LoadInt32(&inEscapeMode) == 0 {
+				os.Stdout.WriteString(applyColors(out))
+			}
 		}
 
 		tBuf = tBuf[i:]
