@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 	"sync"
+	"sync/atomic"
 	"reflect"
 
 	"golang.org/x/term"
@@ -75,11 +76,11 @@ type Editor struct {
 }
 
 type RingBuffer struct {
-	data []byte
-	size int
-	pos  int
-	full bool
-	mu   sync.Mutex
+	data         []byte
+	size         int
+	pos          int
+	totalWritten int64
+	mu           sync.Mutex
 }
 
 // ---- Структуры конфига ----
@@ -141,13 +142,14 @@ var (
 	colorRulesMutex sync.RWMutex
 
 	serverDisconnect = make(chan struct{}, 1)
-	inputLocked bool
+	inputLocked int32 // atomic: 1 = locked
 	secretsAvailable = true
 	lastOutput = NewRingBuffer(8192)
 	globalWaitTimeout int
 	currentWaitTimeout int
-    cachedGCM cipher.AEAD
-    gcmOnce sync.Once
+	cachedGCM    cipher.AEAD
+	cachedGCMErr error
+	gcmOnce      sync.Once
 	keyOnce sync.Once
 	cachedKey []byte
 	configCache ConfigFile
@@ -171,10 +173,7 @@ func (r *RingBuffer) Write(p []byte) {
 	for _, b := range p {
 		r.data[r.pos] = b
 		r.pos = (r.pos + 1) % r.size
-
-		if r.pos == 0 {
-			r.full = true
-		}
+		r.totalWritten++
 	}
 }
 
@@ -182,50 +181,14 @@ func (r *RingBuffer) String() string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	if !r.full {
+	if r.totalWritten < int64(r.size) {
 		return string(r.data[:r.pos])
 	}
 
 	return string(r.data[r.pos:]) + string(r.data[:r.pos])
 }
 
-// TotalWritten возвращает суммарное число записанных байт (монотонно растёт).
-func (r *RingBuffer) TotalWritten() int64 {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.full {
-		return int64(r.size) + int64(r.pos)
-	}
-	return int64(r.pos)
-}
 
-// Since возвращает данные записанные после snapshot (значение TotalWritten на момент входа).
-func (r *RingBuffer) Since(snapshot int64) string {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	var total int64
-	if r.full {
-		total = int64(r.size) + int64(r.pos)
-	} else {
-		total = int64(r.pos)
-	}
-
-	newBytes := total - snapshot
-	if newBytes <= 0 {
-		return ""
-	}
-	if newBytes > int64(r.size) {
-		newBytes = int64(r.size)
-	}
-
-	end := r.pos
-	start := (end - int(newBytes) + r.size) % r.size
-	if start < end {
-		return string(r.data[start:end])
-	}
-	return string(r.data[start:]) + string(r.data[:end])
-}
 
 func autocomplete(input string) (string, []string) {
 	var matches []string
@@ -477,6 +440,7 @@ func deleteMasterKey() {
 	
 	cachedKey = nil
 	cachedGCM = nil
+	cachedGCMErr = nil
 	keyOnce = sync.Once{}
 	gcmOnce = sync.Once{}
 
@@ -566,6 +530,7 @@ func importMasterKey(stdinChan <-chan []byte) {
 
 	cachedKey = nil
 	cachedGCM = nil
+	cachedGCMErr = nil
 	keyOnce = sync.Once{}
 	gcmOnce = sync.Once{}
 	
@@ -573,25 +538,23 @@ func importMasterKey(stdinChan <-chan []byte) {
 }
 
 func getGCM() (cipher.AEAD, error) {
-    var initErr error
+	gcmOnce.Do(func() {
+		key := getMasterKey()
+		if key == nil {
+			cachedGCMErr = fmt.Errorf("no master key")
+			return
+		}
 
-    gcmOnce.Do(func() {
-        key := getMasterKey()
-        if key == nil {
-            initErr = fmt.Errorf("no master key")
-            return
-        }
+		block, err := aes.NewCipher(key)
+		if err != nil {
+			cachedGCMErr = err
+			return
+		}
 
-        block, err := aes.NewCipher(key)
-        if err != nil {
-            initErr = err
-            return
-        }
+		cachedGCM, cachedGCMErr = cipher.NewGCM(block)
+	})
 
-        cachedGCM, initErr = cipher.NewGCM(block)
-    })
-
-    return cachedGCM, initErr
+	return cachedGCM, cachedGCMErr
 }
 
 func encryptString(s string) string {
@@ -1183,8 +1146,8 @@ func runOnConnectCommands(commands []string) {
 		return
 	}
 
-	inputLocked = true
-	defer func() { inputLocked = false }()
+	atomic.StoreInt32(&inputLocked, 1)
+	defer func() { atomic.StoreInt32(&inputLocked, 0) }()
 
 	time.Sleep(500 * time.Millisecond)
 
@@ -1539,24 +1502,19 @@ func runEditor(stdinChan <-chan []byte, initial []string) ([]string, bool) {
 	}
 }
 
-func escapeMode(stdinChan <-chan []byte) bool {
-	// Снимаем snapshot буфера — чтобы после выхода допечатать только новое
-	snapshotPos := lastOutput.TotalWritten()
 
-	// Переходим в альтернативный буфер (экран сессии сохраняется)
+func escapeMode(stdinChan <-chan []byte) bool {
+	// Переходим в альтернативный буфер — экран сессии сохраняется терминалом
 	fmt.Print("\033[?1049h\033[H\033[2J")
 
-	// restore: возвращаемся на основной экран и допечатываем данные пришедшие пока были в escape
+	// restore вызывается при любом выходе кроме quit —
+	// возвращает основной буфер (данные сессии видны как были)
 	restore := func() {
 		fmt.Print("\033[?1049l")
-		newData := lastOutput.Since(snapshotPos)
-		if newData != "" {
-			os.Stdout.WriteString(applyColors(newData))
-		}
 	}
 
 	for {
-		fmt.Printf("\r\n%stelnet>%s ", ColorYellow, ColorReset)
+		fmt.Printf("%stelnet>%s ", ColorYellow, ColorReset)
 		
 		// Используем уже готовую функцию, которая умеет в стрелочки и редактирование
 		line := readLineInteractive(stdinChan, &escapeHistory)
@@ -2149,7 +2107,7 @@ func main() {
 				continue
 			}
 
-			if inputLocked {
+			if atomic.LoadInt32(&inputLocked) == 1 {
 				continue
 			}
 			
