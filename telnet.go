@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 	"sync"
+	"reflect"
 
 	"golang.org/x/term"
 	keyring "github.com/zalando/go-keyring"
@@ -51,10 +52,34 @@ var ansiColors = map[string]string{
 	"reset":   ColorReset,
 }
 
+var commands = map[string]string{
+	"connect":    "connect <host>[:port] - connect to host",
+	"savehost":   "savehost [alias] - save current host",
+	"keepalive":  "keepalive [sec] - set keepalive",
+	"onconnect":  "onconnect edit|show|clear",
+	"keys":       "keys import|export|delete|status",
+	"status":     "show connection status",
+	"resume":     "return to session",
+	"quit":       "exit client",
+}
+
+var subcommands = map[string][]string{
+	"onconnect": {"edit", "show", "clear"},
+	"keys":      {"import", "export", "delete", "status"},
+}
+
 type Editor struct {
 	lines  []string
 	row    int
 	col    int
+}
+
+type RingBuffer struct {
+	data []byte
+	size int
+	pos  int
+	full bool
+	mu   sync.Mutex
 }
 
 // ---- Структуры конфига ----
@@ -113,15 +138,309 @@ var (
 	configByHost   map[string]HostConfig // индекс по "host" и "host:port"
 	configDefaults DefaultsConfig
 	colorRules    []CompiledRule
+	colorRulesMutex sync.RWMutex
 
 	serverDisconnect = make(chan struct{}, 1)
 	inputLocked bool
 	secretsAvailable = true
-	lastOutput string
-	lastOutputMutex sync.Mutex
+	lastOutput = NewRingBuffer(8192)
 	globalWaitTimeout int
 	currentWaitTimeout int
+    cachedGCM cipher.AEAD
+    gcmOnce sync.Once
+	keyOnce sync.Once
+	cachedKey []byte
+	configCache ConfigFile
+	configPath string
+	configLoaded bool
+	
+	escapeHistory []string 
 )
+
+func NewRingBuffer(size int) *RingBuffer {
+	return &RingBuffer{
+		data: make([]byte, size),
+		size: size,
+	}
+}
+
+func (r *RingBuffer) Write(p []byte) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	for _, b := range p {
+		r.data[r.pos] = b
+		r.pos = (r.pos + 1) % r.size
+
+		if r.pos == 0 {
+			r.full = true
+		}
+	}
+}
+
+func (r *RingBuffer) String() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if !r.full {
+		return string(r.data[:r.pos])
+	}
+
+	return string(r.data[r.pos:]) + string(r.data[:r.pos])
+}
+
+// TotalWritten возвращает суммарное число записанных байт (монотонно растёт).
+func (r *RingBuffer) TotalWritten() int64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.full {
+		return int64(r.size) + int64(r.pos)
+	}
+	return int64(r.pos)
+}
+
+// Since возвращает данные записанные после snapshot (значение TotalWritten на момент входа).
+func (r *RingBuffer) Since(snapshot int64) string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	var total int64
+	if r.full {
+		total = int64(r.size) + int64(r.pos)
+	} else {
+		total = int64(r.pos)
+	}
+
+	newBytes := total - snapshot
+	if newBytes <= 0 {
+		return ""
+	}
+	if newBytes > int64(r.size) {
+		newBytes = int64(r.size)
+	}
+
+	end := r.pos
+	start := (end - int(newBytes) + r.size) % r.size
+	if start < end {
+		return string(r.data[start:end])
+	}
+	return string(r.data[start:]) + string(r.data[:end])
+}
+
+func autocomplete(input string) (string, []string) {
+	var matches []string
+
+	for cmd := range commands {
+		if strings.HasPrefix(cmd, input) {
+			matches = append(matches, cmd)
+		}
+	}
+
+	if len(matches) == 1 {
+		return matches[0], nil
+	}
+
+	return "", matches
+}
+
+func getInlineHelp(line string) string {
+	parts := strings.Fields(line)
+
+	if len(parts) == 0 {
+		return ""
+	}
+
+	cmd := strings.ToLower(parts[0])
+
+	// точное совпадение
+	if help, ok := commands[cmd]; ok {
+		return help
+	}
+
+	// частичное совпадение
+	for k, v := range commands {
+		if strings.HasPrefix(k, cmd) {
+			return v
+		}
+	}
+
+	return ""
+}
+
+func readLineInteractive(stdinChan <-chan []byte, history *[]string) string {
+	var line []byte
+	cursor := 0
+	hIndex := len(*history)
+
+	redraw := func() {
+		fmt.Print("\r\033[K")
+
+		prompt := fmt.Sprintf("%stelnet>%s %s", ColorYellow, ColorReset, string(line))
+
+		help := getInlineHelp(string(line))
+
+		if help != "" {
+			fmt.Printf("%s  %s%s%s", prompt, ColorCyan, help, ColorReset)
+		} else {
+			fmt.Print(prompt)
+		}
+
+		back := len(line) - cursor
+		if back > 0 {
+			fmt.Printf("\033[%dD", back)
+		}
+	}
+
+	for {
+		chunk := <-stdinChan
+
+		for i := 0; i < len(chunk); i++ {
+			b := chunk[i]
+
+			// ENTER
+			if b == '\r' || b == '\n' {
+				fmt.Print("\r\n")
+				return string(line)
+			}
+			
+			// TAB
+			if b == '\t' {
+				input := string(line)
+				parts := strings.Fields(input)
+
+				// --- 1. автокомплит команды ---
+				if len(parts) <= 1 {
+					prefix := input
+
+					full, matches := autocomplete(prefix)
+
+					if full != "" {
+						line = []byte(full + " ")
+						cursor = len(line)
+						redraw()
+						continue
+					}
+
+					if len(matches) > 1 {
+						fmt.Print("\r\n")
+						for _, m := range matches {
+							fmt.Println(m)
+						}
+						redraw()
+					}
+
+					continue
+				}
+
+				// --- 2. автокомплит подкоманд ---
+				if len(parts) == 2 {
+					cmd := parts[0]
+					argPrefix := parts[1]
+
+					if subs, ok := subcommands[cmd]; ok {
+
+						var matches []string
+						for _, s := range subs {
+							if strings.HasPrefix(s, argPrefix) {
+								matches = append(matches, s)
+							}
+						}
+
+						if len(matches) == 1 {
+							line = []byte(cmd + " " + matches[0] + " ")
+							cursor = len(line)
+							redraw()
+							continue
+						}
+
+						if len(matches) > 1 {
+							fmt.Print("\r\n")
+							for _, m := range matches {
+								fmt.Println(m)
+							}
+							redraw()
+						}
+					}
+				}
+
+				continue
+			}
+
+			// BACKSPACE
+			if b == 0x08 || b == 0x7f {
+				if cursor > 0 {
+					line = append(line[:cursor-1], line[cursor:]...)
+					cursor--
+					redraw()
+				}
+				continue
+			}
+
+			// ESC sequences
+			if b == 27 && i+2 < len(chunk) && chunk[i+1] == 91 {
+				code := chunk[i+2]
+				i += 2
+
+				switch code {
+
+				case 65: // ↑ history up
+					if len(*history) > 0 && hIndex > 0 {
+						hIndex--
+						line = []byte((*history)[hIndex])
+						cursor = len(line)
+						redraw()
+					}
+
+				case 66: // ↓ history down
+					if hIndex < len(*history)-1 {
+						hIndex++
+						line = []byte((*history)[hIndex])
+					} else {
+						hIndex = len(*history)
+						line = nil
+					}
+					cursor = len(line)
+					redraw()
+
+				case 67: // →
+					if cursor < len(line) {
+						cursor++
+						redraw()
+					}
+
+				case 68: // ←
+					if cursor > 0 {
+						cursor--
+						redraw()
+					}
+				}
+
+				continue
+			}
+
+			// обычный символ
+			if b >= 32 && b <= 126 {
+				line = append(line[:cursor], append([]byte{b}, line[cursor:]...)...)
+				cursor++
+				redraw()
+			}
+		}
+	}
+}
+
+func enableRaw() {
+	var err error
+	oldState, err = term.MakeRaw(int(os.Stdin.Fd()))
+	if err != nil {
+		fmt.Println("Raw mode error:", err)
+	}
+}
+
+func disableRaw() {
+	if oldState != nil {
+		term.Restore(int(os.Stdin.Fd()), oldState)
+	}
+}
 
 // Keyring funcs
 func keyStatus() {
@@ -155,29 +474,22 @@ func deleteMasterKey() {
 		fmt.Println("Failed to delete key:", err)
 		return
 	}
+	
+	cachedKey = nil
+	cachedGCM = nil
+	keyOnce = sync.Once{}
+	gcmOnce = sync.Once{}
 
 	fmt.Println("Master key deleted")
 }
 
 func validateMasterKeyFromConfig() {
-	exePath, err := os.Executable()
-	if err != nil {
-		return
-	}
+	loadFullConfig()
+	for _, h := range configCache.Hosts {
+		if len(h.OnConnect) == 0 {
+			continue
+		}
 
-	configPath := filepath.Join(filepath.Dir(exePath), "telnet.json")
-
-	data, err := os.ReadFile(configPath)
-	if err != nil {
-		return
-	}
-
-	var cfg ConfigFile
-	if err := json.Unmarshal(data, &cfg); err != nil {
-		return
-	}
-
-	for _, h := range cfg.Hosts {
 		for _, cmd := range h.OnConnect {
 			if strings.HasPrefix(cmd, "enc:") {
 				_, err := decryptString(strings.TrimPrefix(cmd, "enc:"))
@@ -185,7 +497,6 @@ func validateMasterKeyFromConfig() {
 					fmt.Printf("%s[warn] master key invalid (cannot decrypt secrets)%s\r\n", ColorYellow, ColorReset)
 					return
 				}
-				// если хоть один расшифровался — ок
 				return
 			}
 		}
@@ -253,20 +564,46 @@ func importMasterKey(stdinChan <-chan []byte) {
 		return
 	}
 
+	cachedKey = nil
+	cachedGCM = nil
+	keyOnce = sync.Once{}
+	gcmOnce = sync.Once{}
+	
 	fmt.Println("Master key imported")
 }
 
+func getGCM() (cipher.AEAD, error) {
+    var initErr error
+
+    gcmOnce.Do(func() {
+        key := getMasterKey()
+        if key == nil {
+            initErr = fmt.Errorf("no master key")
+            return
+        }
+
+        block, err := aes.NewCipher(key)
+        if err != nil {
+            initErr = err
+            return
+        }
+
+        cachedGCM, initErr = cipher.NewGCM(block)
+    })
+
+    return cachedGCM, initErr
+}
+
 func encryptString(s string) string {
-	key := getMasterKey()
-	if key == nil {
+	gcm, err := getGCM()
+	if err != nil {
 		return ""
 	}
 
-	block, _ := aes.NewCipher(key)
-	gcm, _ := cipher.NewGCM(block)
-
 	nonce := make([]byte, gcm.NonceSize())
-	rand.Read(nonce)
+	if _, err := rand.Read(nonce); err != nil {
+		return ""
+	}
 
 	data := gcm.Seal(nonce, nonce, []byte(s), nil)
 
@@ -274,18 +611,15 @@ func encryptString(s string) string {
 }
 
 func decryptString(enc string) (string, error) {
-	key := getMasterKey()
-	if key == nil {
-		return "", fmt.Errorf("no master key")
+	gcm, err := getGCM()
+	if err != nil {
+		return "", err
 	}
 
 	data, err := base64.StdEncoding.DecodeString(enc)
 	if err != nil {
 		return "", fmt.Errorf("invalid base64")
 	}
-
-	block, _ := aes.NewCipher(key)
-	gcm, _ := cipher.NewGCM(block)
 
 	n := gcm.NonceSize()
 
@@ -302,34 +636,35 @@ func decryptString(enc string) (string, error) {
 }
 
 func getMasterKey() []byte {
-	key, err := keyring.Get("telnet-client", "master_key")
+	keyOnce.Do(func() {
+		key, err := keyring.Get("telnet-client", "master_key")
 
-	if err == nil {
-		return []byte(key)
-	}
+		if err == nil {
+			cachedKey = []byte(key)
+			return
+		}
 
-	if err != keyring.ErrNotFound {
-		fmt.Println("[warn] keyring unavailable:", err)
-		secretsAvailable = false
-		return nil
-	}
+		if err != keyring.ErrNotFound {
+			fmt.Println("[warn] keyring unavailable:", err)
+			secretsAvailable = false
+			return
+		}
 
-	buf := make([]byte, 32)
-	_, err = rand.Read(buf)
-	if err != nil {
-		secretsAvailable = false
-		return nil
-	}
+		buf := make([]byte, 32)
+		_, err = rand.Read(buf)
+		if err != nil {
+			secretsAvailable = false
+			return
+		}
 
-	err = keyring.Set("telnet-client", "master_key", string(buf))
-	if err != nil {
-		secretsAvailable = false
-		return nil
-	}
+		if err := keyring.Set("telnet-client", "master_key", string(buf)); err != nil {
+			secretsAvailable = false
+		}
+		cachedKey = buf
+	})
 
-	return buf
+	return cachedKey
 }
-
 func processEditorLines(lines []string) []string {
 	var result []string
 
@@ -412,9 +747,7 @@ func waitForPattern(pattern string, timeout int) bool {
 	start := time.Now()
 
 	for {
-		lastOutputMutex.Lock()
-		found := strings.Contains(lastOutput, pattern)
-		lastOutputMutex.Unlock()
+		found := strings.Contains(lastOutput.String(), pattern)
 
 		if found {
 			return true
@@ -440,9 +773,7 @@ func waitForRegex(pattern string, timeout int) bool {
 	start := time.Now()
 
 	for {
-		lastOutputMutex.Lock()
-		found := re.MatchString(lastOutput)
-		lastOutputMutex.Unlock()
+		found := re.MatchString(lastOutput.String())
 
 		if found {
 			return true
@@ -458,6 +789,122 @@ func waitForRegex(pattern string, timeout int) bool {
 
 
 //config funcs
+func reloadConfig() {
+	configLoaded = false
+	loadFullConfig()
+
+	configAliases, configByHost = buildIndexesFromCache()
+	buildColorRulesFromCache()
+
+	fmt.Printf("%sConfig reloaded%s\r\n", ColorGreen, ColorReset)
+}
+
+func mergeHostConfig(old HostConfig, new HostConfig) HostConfig {
+	result := old
+
+	if new.Alias != "" {
+		result.Alias = new.Alias
+	}
+
+	if new.KeepAlive != 0 {
+		result.KeepAlive = new.KeepAlive
+	}
+
+	if new.KeepAliveType != "" {
+		result.KeepAliveType = new.KeepAliveType
+	}
+
+	if new.WaitTimeout != 0 {
+		result.WaitTimeout = new.WaitTimeout
+	}
+
+	if new.OnConnect != nil {
+		result.OnConnect = new.OnConnect
+	}
+
+	return result
+}
+
+func saveHostToConfig(hostcfg HostConfig) error {
+	// 🔥 всегда читаем свежий файл
+	data, err := os.ReadFile(configPath)
+
+	var diskConfig ConfigFile
+
+	if err == nil {
+		if err := json.Unmarshal(data, &diskConfig); err != nil {
+			return err
+		}		
+	}
+
+	found := false
+
+	for i := range diskConfig.Hosts {
+		h := &diskConfig.Hosts[i]
+
+		p := h.Port
+		if p == "" {
+			p = "23"
+		}
+
+		port := hostcfg.Port
+		if port == "" {
+			port = "23"
+		}
+
+		if h.Host == hostcfg.Host && p == port {
+
+			merged := mergeHostConfig(*h, hostcfg)
+
+			if reflect.DeepEqual(*h, merged) {
+				return nil
+			}
+
+			*h = merged
+			found = true
+			break
+		}
+	}
+
+	if !found {
+		diskConfig.Hosts = append(diskConfig.Hosts, hostcfg)
+	}
+
+	out, err := json.MarshalIndent(diskConfig, "", "  ")
+	if err != nil {
+		return err
+	}
+
+	// 🔥 атомарная запись
+	if err := writeConfigAtomic(configPath, out); err != nil {
+		return err
+	}
+
+	// 🔥 обновляем cache
+	configCache = diskConfig
+	configAliases, configByHost = buildIndexesFromCache()
+	buildColorRulesFromCache()
+
+	return nil
+}
+
+func writeConfigAtomic(path string, data []byte) error {
+	tmp := path + ".tmp"
+
+	if err := os.WriteFile(tmp, data, 0644); err != nil {
+		return err
+	}
+
+	if err := os.Rename(tmp, path); err != nil {
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		return os.Rename(tmp, path)
+	}
+
+	return nil
+}
+
 func expandCommands(cmds []string) []string {
 	var result []string
 
@@ -474,7 +921,7 @@ func expandCommands(cmds []string) []string {
 				continue
 			}
 
-			lines := strings.Split(plain, "\n")
+			lines := strings.Split(strings.ReplaceAll(plain, "\r\n", "\n"), "\n")
 			result = append(result, lines...)
 			continue
 		}
@@ -485,41 +932,54 @@ func expandCommands(cmds []string) []string {
 	return result
 }
 
-func loadConfig() (map[string]HostConfig, map[string]HostConfig) {
-	aliases := make(map[string]HostConfig)
-	byHost := make(map[string]HostConfig)
-	exePath, err := os.Executable()
-	if err != nil {
-		return aliases, byHost
+func loadFullConfig() {
+	if configLoaded {
+		return
 	}
-	configPath := filepath.Join(filepath.Dir(exePath), "telnet.json")
 
 	data, err := os.ReadFile(configPath)
-	if err != nil {
-		return aliases, byHost
+	if err == nil {
+		configCache = ConfigFile{}
+		if err := json.Unmarshal(data, &configCache); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to parse config: %v\r\n", err)
+		}
 	}
 
-	var cfg ConfigFile
-	if err := json.Unmarshal(data, &cfg); err != nil {
-		fmt.Fprintf(os.Stderr, "Warning: failed to parse telnet.json: %v\r\n", err)
-		return aliases, byHost
-	}
+	configLoaded = true
+}
 
-	for _, h := range cfg.Hosts {
+func buildIndexesFromCache() (map[string]HostConfig, map[string]HostConfig) {
+	aliases := make(map[string]HostConfig)
+	byHost := make(map[string]HostConfig)
+
+	for _, h := range configCache.Hosts {
+
 		if h.Alias != "" {
 			aliases[h.Alias] = h
 		}
+
 		if h.Host != "" {
 			byHost[h.Host] = h
+
 			port := h.Port
 			if port == "" {
 				port = "23"
 			}
+
 			byHost[h.Host+":"+port] = h
 		}
 	}
 
-	for _, cr := range cfg.Colors {
+	return aliases, byHost
+}
+
+func buildColorRulesFromCache() {
+	colorRulesMutex.Lock()
+	defer colorRulesMutex.Unlock()
+
+	colorRules = nil
+
+	for _, cr := range configCache.Colors {
 		re, err := regexp.Compile(cr.Pattern)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: invalid regex pattern '%s': %v\r\n", cr.Pattern, err)
@@ -527,31 +987,26 @@ func loadConfig() (map[string]HostConfig, map[string]HostConfig) {
 		}
 
 		numGroups := re.NumSubexp()
-		groupColors := make([]string, numGroups+1) // [0] = весь match
+		groupColors := make([]string, numGroups+1)
 
 		if len(cr.Groups) > 0 {
-			// Новый формат: groups: {"1": "yellow", "3": "green"}
 			for idxStr, colorName := range cr.Groups {
 				idx, err := strconv.Atoi(idxStr)
 				if err != nil || idx < 1 || idx > numGroups {
-					fmt.Fprintf(os.Stderr, "Warning: invalid group index '%s' for pattern '%s' (has %d groups)\r\n", idxStr, cr.Pattern, numGroups)
 					continue
 				}
+
 				name := strings.ToLower(colorName)
-				code, ok := ansiColors[name]
-				if !ok {
-					fmt.Fprintf(os.Stderr, "Warning: unknown color '%s' for group %s\r\n", colorName, idxStr)
-					continue
+				if code, ok := ansiColors[name]; ok {
+					groupColors[idx] = code
 				}
-				groupColors[idx] = code
 			}
 		} else {
-			// Простой формат: весь match одним цветом
-			colorName := strings.ToLower(cr.Color)
-			if _, ok := ansiColors[colorName]; !ok {
-				colorName = "cyan"
+			name := strings.ToLower(cr.Color)
+			if _, ok := ansiColors[name]; !ok {
+				name = "cyan"
 			}
-			groupColors[0] = ansiColors[colorName]
+			groupColors[0] = ansiColors[name]
 		}
 
 		colorRules = append(colorRules, CompiledRule{
@@ -559,68 +1014,10 @@ func loadConfig() (map[string]HostConfig, map[string]HostConfig) {
 			GroupColors: groupColors,
 		})
 	}
-
-	return aliases, byHost
 }
-
-func saveHostToConfig(hostcfg HostConfig) error {
-	exePath, err := os.Executable()
-	if err != nil {
-		return err
-	}
-
-	configPath := filepath.Join(filepath.Dir(exePath), "telnet.json")
-
-	var cfg ConfigFile
-
-	data, err := os.ReadFile(configPath)
-	if err == nil {
-		json.Unmarshal(data, &cfg)
-	}
-
-    found := false
-
-    for i := range cfg.Hosts {
-        h := &cfg.Hosts[i]
-
-        p := h.Port
-        if p == "" {
-            p = "23"
-        }
-
-		port := hostcfg.Port
-		if port == "" {
-			port = "23"
-		}
-
-        if h.Host == hostcfg.Host && p == port {
-            *h = hostcfg
-            found = true
-            break
-        }
-    }
-
-    if !found {
-        cfg.Hosts = append(cfg.Hosts, hostcfg)
-    }
-
-
-	out, err := json.MarshalIndent(cfg, "", "  ")
-	if err != nil {
-		return err
-	}
-
-	return os.WriteFile(configPath, out, 0644)
-}
-
 // loadConfigDefaults читает только секцию defaults из telnet.json.
 // Вызывается до парсинга флагов, чтобы можно было применить приоритеты.
 func loadConfigDefaults() DefaultsConfig {
-	exePath, err := os.Executable()
-	if err != nil {
-		return DefaultsConfig{}
-	}
-	configPath := filepath.Join(filepath.Dir(exePath), "telnet.json")
 	data, err := os.ReadFile(configPath)
 	if err != nil {
 		return DefaultsConfig{}
@@ -652,12 +1049,18 @@ func findHostConfig(target string) (HostConfig, bool) {
 }
 
 func applyColors(text string) string {
-	if len(colorRules) == 0 {
+	colorRulesMutex.RLock()
+	rules := colorRules
+	colorRulesMutex.RUnlock()
+
+	if len(rules) == 0 {
 		return text
 	}
-	for _, rule := range colorRules {
+
+	for _, rule := range rules {
 		text = applyRule(rule, text)
 	}
+
 	return text
 }
 
@@ -665,26 +1068,39 @@ func readLineRaw(stdinChan <-chan []byte) string {
 	var lineData []byte
 
 	for {
-		chunk := <-stdinChan
-
-		for _, b := range chunk {
-			if b == '\r' || b == '\n' {
-				fmt.Print("\r\n")
+		select {
+		case chunk, ok := <-stdinChan:
+			if !ok {
 				return string(lineData)
 			}
 
-			if b == 0x08 || b == 0x7f {
-				if len(lineData) > 0 {
-					lineData = lineData[:len(lineData)-1]
-					fmt.Print("\b \b")
+			for i := 0; i < len(chunk); i++ {
+				b := chunk[i]
+				if b == '\r' || b == '\n' {
+					if b == '\r' && i+1 < len(chunk) && chunk[i+1] == '\n' {
+						i++
+					}
+					fmt.Print("\r\n")
+					return string(lineData)
 				}
-				continue
+
+				if b == 0x08 || b == 0x7f {
+					if len(lineData) > 0 {
+						lineData = lineData[:len(lineData)-1]
+						fmt.Print("\b \b")
+					}
+					continue
+				}
+
+				if b >= 32 && b <= 126 {
+					lineData = append(lineData, b)
+					fmt.Print(string(b))
+				}
 			}
-	
-			if b >= 32 && b <= 126 {
-				lineData = append(lineData, b)
-				fmt.Print(string(b))
-			}
+
+		case <-time.After(5 * time.Minute):
+			fmt.Println("\r\n[timeout waiting input]")
+			return string(lineData)
 		}
 	}
 }
@@ -964,12 +1380,13 @@ func runEditor(stdinChan <-chan []byte, initial []string) ([]string, bool) {
 
 			// Ctrl+D → save
 			if b == 4 {
-				fmt.Println()
+				fmt.Print("\033[H\033[2J")
 				return e.lines, true
 			}
 
 			// Ctrl+C → cancel
 			if b == 3 {
+				fmt.Print("\033[H\033[2J")
 				fmt.Println("\nCancelled")
 				return nil, false
 			}
@@ -1123,51 +1540,48 @@ func runEditor(stdinChan <-chan []byte, initial []string) ([]string, bool) {
 }
 
 func escapeMode(stdinChan <-chan []byte) bool {
+	// Снимаем snapshot буфера — чтобы после выхода допечатать только новое
+	snapshotPos := lastOutput.TotalWritten()
+
+	// Переходим в альтернативный буфер (экран сессии сохраняется)
+	fmt.Print("\033[?1049h\033[H\033[2J")
+
+	// restore: возвращаемся на основной экран и допечатываем данные пришедшие пока были в escape
+	restore := func() {
+		fmt.Print("\033[?1049l")
+		newData := lastOutput.Since(snapshotPos)
+		if newData != "" {
+			os.Stdout.WriteString(applyColors(newData))
+		}
+	}
+
 	for {
 		fmt.Printf("\r\n%stelnet>%s ", ColorYellow, ColorReset)
+		
+		// Используем уже готовую функцию, которая умеет в стрелочки и редактирование
+		line := readLineInteractive(stdinChan, &escapeHistory)
+		cmd := strings.TrimSpace(line)
 
-		var lineData []byte
-	readLoop:
-		for {
-			chunk, ok := <-stdinChan
-			if !ok {
-				return true
-			}
-
-			for _, b := range chunk {
-				if b == '\r' || b == '\n' {
-					fmt.Print("\r\n")
-					break readLoop
-				} else if b == 0x08 || b == 0x7f {
-					if len(lineData) > 0 {
-						lineData = lineData[:len(lineData)-1]
-						fmt.Print("\b \b")
-					}
-				} else if b >= 32 && b <= 126 {
-					lineData = append(lineData, b)
-					fmt.Print(string(b))
-				}
-			}
+		if cmd == "" {
+			continue
 		}
 
-		cmd := strings.TrimSpace(string(lineData))
+		// Добавляем в историю, если команда не пустая
+		escapeHistory = append(escapeHistory, cmd)
+
 		parts := strings.Fields(cmd)
-
-		if len(parts) == 0 {
-			return false
-		}
-
 		baseCmd := strings.ToLower(parts[0])
 
 		switch baseCmd {
+		case "reload":
+			reloadConfig()
+		
 		case "savehost":
 			var alias string
-
-			if len(parts) >= 2 {
+				if len(parts) >= 2 {
 				alias = parts[1]
 			}
-
-			if addr == "" {
+				if addr == "" {
 				fmt.Printf("%sNo active host%s\r\n", ColorRed, ColorReset)
 				break
 			}
@@ -1177,7 +1591,7 @@ func escapeMode(stdinChan <-chan []byte) bool {
 				fmt.Printf("%sInvalid address%s\r\n", ColorRed, ColorReset)
 				break
 			}
-			
+		
 			cfg := HostConfig{
 				Alias:         alias,
 				Host:          host,
@@ -1186,24 +1600,22 @@ func escapeMode(stdinChan <-chan []byte) bool {
 				KeepAliveType: keepaliveType,
 				WaitTimeout:   currentWaitTimeout,
 			}
-			
+		
 			existing, ok := findHostConfig(addr)
 			if ok {
 				cfg.OnConnect = existing.OnConnect
 			}
-
-			err = saveHostToConfig(cfg)
+				err = saveHostToConfig(cfg)
 			if err != nil {
 				fmt.Printf("%sFailed to save host: %v%s\r\n", ColorRed, err, ColorReset)
 				break
 			}
-
-			if alias == "" {
+				if alias == "" {
 				fmt.Printf("%sHost saved: %s%s\r\n", ColorGreen, addr, ColorReset)
 			} else {
 				fmt.Printf("%sHost saved as alias '%s'%s\r\n", ColorGreen, alias, ColorReset)
 			}
-			
+		
 		case "q", "quit", "exit":
 			fmt.Printf("%sBye%s\r\n", ColorCyan, ColorReset)
 			if conn != nil {
@@ -1212,10 +1624,9 @@ func escapeMode(stdinChan <-chan []byte) bool {
 				c.Close()
 			}
 			return true
-
 		case "resume", "c":
+			restore()
 			return false
-
 		case "status":
 			if conn != nil {
 				fmt.Printf("%sConnected to %s%s\r\n", ColorGreen, addr, ColorReset)
@@ -1235,18 +1646,17 @@ func escapeMode(stdinChan <-chan []byte) bool {
 				c.Close()
 			}
 			fmt.Printf("%sConnection closed%s\r\n", ColorCyan, ColorReset)
-
+				
 		case "reconnect":
 			if conn != nil {
 				c := conn
 				conn = nil
 				c.Close()
 			}
-
 			select {
-			case <-serverDisconnect:
-			default:
-			}
+				case <-serverDisconnect:
+					default:
+				}
 
 			fmt.Printf("%sReconnecting...%s\r\n", ColorCyan, ColorReset)
 			if err := connect(); err != nil {
@@ -1254,6 +1664,7 @@ func escapeMode(stdinChan <-chan []byte) bool {
 			} else {
 				fmt.Printf("%sReconnected%s\r\n", ColorGreen, ColorReset)
 			}
+			restore()
 			return false
 
 		case "connect":
@@ -1269,8 +1680,8 @@ func escapeMode(stdinChan <-chan []byte) bool {
 			}
 
 			select {
-			case <-serverDisconnect:
-			default:
+				case <-serverDisconnect:
+					default:
 			}
 
 			newTarget := parts[1]
@@ -1286,7 +1697,7 @@ func escapeMode(stdinChan <-chan []byte) bool {
 				}
 				addr = host + ":" + port
 				commandsToRun = append(commandsToRun, expandCommands(cfg.OnConnect)...)
- 			} else {
+			} else {
 				if !strings.Contains(newTarget, ":") {
 					newTarget = newTarget + ":23"
 				}
@@ -1304,6 +1715,7 @@ func escapeMode(stdinChan <-chan []byte) bool {
 					go runOnConnectCommands(commandsToRun)
 				}
 			}
+			restore()
 			return false
 
 		case "keepalive":
@@ -1327,11 +1739,11 @@ func escapeMode(stdinChan <-chan []byte) bool {
 			if idleTimer != nil {
 				if !idleTimer.Stop() {
 					select {
-					case <-idleTimer.C:
-					default:
+						case <-idleTimer.C:
+							default:
+						}
 					}
 				}
-			}
 
 			if sec == 0 {
 				idleTimer = nil
@@ -1346,7 +1758,7 @@ func escapeMode(stdinChan <-chan []byte) bool {
 				timerCh = idleTimer.C
 				fmt.Printf("Anti-idle set to %d seconds.\r\n", sec)
 			}
-			
+
 		case "onconnect":
 			if addr == "" {
 				fmt.Printf("%sNo active host%s\r\n", ColorRed, ColorReset)
@@ -1369,10 +1781,12 @@ func escapeMode(stdinChan <-chan []byte) bool {
 			switch sub {
 				case "clear":
 					cfg, ok := findHostConfig(addr)
-					if ok {
-						cfg.OnConnect = nil
+					if !ok {
+						fmt.Printf("%sHost not found%s\r\n", ColorRed, ColorReset)
+						break
 					}
 
+					cfg.OnConnect = nil
 					err := saveHostToConfig(cfg)
 					if err != nil {
 						fmt.Printf("%sFailed to update config: %v%s\r\n", ColorRed, err, ColorReset)
@@ -1421,12 +1835,12 @@ func escapeMode(stdinChan <-chan []byte) bool {
 					fmt.Printf("%sOn-connect updated%s\r\n", ColorGreen, ColorReset)
 
 				default:
-					fmt.Printf("%sUnknown subcommand%s\r\n", ColorRed, ColorReset)
+						fmt.Printf("%sUnknown subcommand%s\r\n", ColorRed, ColorReset)
 				}
 				
 		case "keys":
 			handleKeysCommand(parts, stdinChan)
-
+				
 		case "help", "?":
 			fmt.Printf("%sAvailable commands:%s\r\n", ColorYellow, ColorReset)
 			fmt.Printf("  %ssavehost [alias]%s             - Save current host to config\r\n", ColorGreen, ColorReset)
@@ -1482,14 +1896,7 @@ func readerLoop(c net.Conn) {
 				if len(textChunk) > 0 {
 					out := string(textChunk)
 
-					lastOutputMutex.Lock()
-					lastOutput += out
-
-					if len(lastOutput) > 8192 {
-						lastOutput = lastOutput[len(lastOutput)-8192:]
-					}
-
-					lastOutputMutex.Unlock()
+					lastOutput.Write([]byte(out))
 
 					os.Stdout.WriteString(applyColors(out))
 					textChunk = nil
@@ -1536,14 +1943,7 @@ func readerLoop(c net.Conn) {
 		if len(textChunk) > 0 {
 			out := string(textChunk)
 
-			lastOutputMutex.Lock()
-			lastOutput += out
-
-			if len(lastOutput) > 8192 {
-				lastOutput = lastOutput[len(lastOutput)-8192:]
-			}
-	
-			lastOutputMutex.Unlock()
+			lastOutput.Write([]byte(out))
 
 			os.Stdout.WriteString(applyColors(out))
 		}
@@ -1572,6 +1972,8 @@ func watchWindowSize() {
 }
 
 func main() {
+	exePath, _ := os.Executable()
+	configPath = filepath.Join(filepath.Dir(exePath), "telnet.json")
 	// Читаем JSON-дефолты ДО парсинга флагов, чтобы определить приоритеты.
 	// Приоритет: хост-конфиг > явный флаг CLI > defaults из JSON > встроенные значения.
 	jsonDefaults := loadConfigDefaults()
@@ -1638,7 +2040,9 @@ func main() {
 		return
 	}
 
-	configAliases, configByHost = loadConfig()
+	loadFullConfig()
+	configAliases, configByHost = buildIndexesFromCache()
+	buildColorRulesFromCache()
 	validateMasterKeyFromConfig()
 	
 	inputTarget := flag.Arg(0)
@@ -1673,12 +2077,7 @@ func main() {
 		return
 	}
 
-	var err error
-	oldState, err = term.MakeRaw(int(os.Stdin.Fd()))
-	if err != nil {
-		fmt.Println("Raw mode error:", err)
-		return
-	}
+	enableRaw()
 
 	defer func() {
 		term.Restore(int(os.Stdin.Fd()), oldState)
