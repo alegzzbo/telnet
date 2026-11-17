@@ -17,7 +17,16 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: '1.22'
-      - run: go mod tidy && git diff --exit-code go.mod || true
+      - name: Tidy and commit go.sum
+        run: |
+          go mod tidy
+          if [ -n "$(git status --porcelain go.mod go.sum)" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add go.mod go.sum
+            git commit -m "chore: add go.sum"
+            git push
+          fi
       - run: gofmt -l . | tee /dev/stderr | (! read)
       - run: go vet ./...
       - run: go test -race ./...
@@ -40,6 +49,8 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: '1.22'
+      - name: Download dependencies
+        run: go mod tidy
       - name: Build
         run: |
           ext=""; [ "$GOOS" = windows ] && ext=".exe"
